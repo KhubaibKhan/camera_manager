@@ -7,6 +7,8 @@ import pyrealsense2 as rs
 import threading
 import numpy as np
 from cv_bridge import CvBridge
+from pathlib import Path
+
 
 class CameraManagerNode(Node):
     def __init__(self):
@@ -21,6 +23,9 @@ class CameraManagerNode(Node):
         if len(devs) == 0:
             self.get_logger().error('No RealSense devices found!')
             raise RuntimeError('No devices')
+        
+        # global lock
+        self.mutex = threading.Lock()
 
         # Prepare pipelines and a separate publisher dictionary
         self.pipelines = {}
@@ -68,26 +73,70 @@ class CameraManagerNode(Node):
         thread.start()
 
     def select_callback(self, msg: String):
-        requested = {s.strip() for s in msg.data.split(',') if s.strip()}
-        # Start requested cameras
-        for serial in requested - self.active_serials:
-            if serial in self.pipelines:
-                self.get_logger().info(f"Starting camera {serial}")
-                self.pipelines[serial]['pipeline'].start(self.pipelines[serial]['config'])
-                self.pipelines[serial]['running'] = True
-        # Stop cameras no longer requested
-        for serial in self.active_serials - requested:
-            if serial in self.pipelines:
-                self.get_logger().info(f"Stopping camera {serial}")
-                self.pipelines[serial]['pipeline'].stop()
-                self.pipelines[serial]['running'] = False
-        self.active_serials = requested & set(self.pipelines.keys())
+        requested = {tok.strip() for tok in msg.data.split(',') if tok.strip()}
+        with self.mutex:
+            # ── ① On-demand creation for any new .bag tokens ───────────────
+            for tok in requested:
+                if tok.endswith('.bag') and Path(tok).is_file() and tok not in self.pipelines:
+                    cfg, pipe = rs.config(), rs.pipeline()
+                    cfg.enable_device_from_file(str(Path(tok).expanduser()),
+                                                repeat_playback=False)
+                    safe = Path(tok).stem
+                    self.pipelines[tok] = {
+                        'config':   cfg,
+                        'pipeline': pipe,
+                        'running':  False,
+                        'dtype':    'bag'
+                    }
+                    self.pub_dict[tok] = {
+                        'color': self.create_publisher(
+                            Image, f'camera/{safe}/color/image_raw', 10),
+                        'depth': self.create_publisher(
+                            Image, f'camera/{safe}/depth/image_raw', 10)
+                    }
+
+            # ──Start requested cameras (live or bag) ───────────────────
+            for tok in requested - self.active_serials:
+                if tok in self.pipelines:
+                    self.get_logger().info(f"Starting camera {tok}")
+                    profile = self.pipelines[tok]['pipeline'].start(
+                        self.pipelines[tok]['config'])
+                    # if this is a playback bag, switch to non-real-time mode
+                    if self.pipelines[tok].get('dtype') == 'bag':
+                        profile.get_device().as_playback().set_real_time(False)
+                    self.pipelines[tok]['running'] = True
+
+            #Stop pipelines no longer requested
+            for tok in self.active_serials - requested:
+                bundle = self.pipelines.get(tok)
+                if bundle and bundle['running']:
+                    bundle['running'] = False
+                    bundle['pipeline'].stop()
+                    self.get_logger().info(f"Stopped {tok}")
+
+            # Update active set ──────────────────────────────────────────
+            self.active_serials = requested
 
     def capture_loop(self):
         while rclpy.ok():
+            with self.mutex:                    # single atomic snapshot
+                active_now = [s for s in self.active_serials
+                               if self.pipelines[s]['running']]
             for serial in list(self.active_serials):
+                if not self.pipelines[serial]['running']:
+                    continue
                 pipe = self.pipelines[serial]['pipeline']
-                frames = pipe.wait_for_frames()
+                try:
+                    frames = pipe.wait_for_frames()
+                except rs.error as e:
+                    # if a bag playback hits EOF, stop that pipeline cleanly
+                    if 'end of file' in str(e).lower():
+                        self.get_logger().info(f"Bag finished: {serial}")
+                        self.pipelines[serial]['running'] = False
+                        continue
+                    # otherwise log any other frame error
+                    self.get_logger().error(f"Error capturing frames from {serial}: {e}")
+                    continue
                 color_frame = frames.get_color_frame()
                 depth_frame = frames.get_depth_frame()
                 if color_frame:
